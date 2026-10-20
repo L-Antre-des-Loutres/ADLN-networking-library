@@ -1,0 +1,19 @@
+[package]
+name = "adln-networking"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "ADLN networking for standalone Nintendo DS game services"
+publish = false
+
+[dependencies]
+rand = "0.8.5"
+subtle = "2.6"
+thiserror = "2"
+tokio = { version = "1", features = ["net", "time", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "sync"] }
+
+[lints.rust]
+unsafe_code = "forbid"
