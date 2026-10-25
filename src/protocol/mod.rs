@@ -55,6 +55,10 @@ pub enum Kind {
     Pong = 5,
     Data = 6,
     Disconnect = 7,
+    AuthHello = 8,
+    AuthChallenge = 9,
+    AuthProof = 10,
+    AuthAccepted = 11,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,12 +79,19 @@ pub struct Packet {
 
 impl Packet {
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        self.encode_version(VERSION)
+    }
+
+    pub(crate) fn encode_version(&self, version: u8) -> Result<Vec<u8>, ProtocolError> {
+        if version == VERSION && self.kind as u8 >= Kind::AuthHello as u8 {
+            return Err(ProtocolError::Kind);
+        }
         if self.payload.len() > MAX_PAYLOAD {
             return Err(ProtocolError::Length);
         }
         let mut bytes = Vec::with_capacity(HEADER_SIZE + self.payload.len());
         bytes.extend(MAGIC);
-        bytes.extend([VERSION, self.kind as u8]);
+        bytes.extend([version, self.kind as u8]);
         bytes.extend((self.payload.len() as u16).to_le_bytes());
         bytes.extend(self.connection.0.to_le_bytes());
         bytes.extend(self.token.0);
@@ -92,10 +103,14 @@ impl Packet {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        Self::decode_version(bytes, VERSION)
+    }
+
+    pub(crate) fn decode_version(bytes: &[u8], version: u8) -> Result<Self, ProtocolError> {
         if bytes.len() < HEADER_SIZE {
             return Err(ProtocolError::Length);
         }
-        if bytes[..4] != MAGIC || bytes[4] != VERSION {
+        if bytes[..4] != MAGIC || bytes[4] != version {
             return Err(ProtocolError::Version);
         }
         if bytes[38..40] != [0, 0] {
@@ -109,6 +124,10 @@ impl Packet {
             5 => Kind::Pong,
             6 => Kind::Data,
             7 => Kind::Disconnect,
+            8 if version == 2 => Kind::AuthHello,
+            9 if version == 2 => Kind::AuthChallenge,
+            10 if version == 2 => Kind::AuthProof,
+            11 if version == 2 => Kind::AuthAccepted,
             _ => return Err(ProtocolError::Kind),
         };
         let length = u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as usize;

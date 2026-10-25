@@ -37,6 +37,18 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    /// Includes the tag and the largest fixed login control message in budgets.
+    pub fn validate_authenticated(&self) -> Result<(), ConfigError> {
+        self.validate()?;
+        let size = (protocol::HEADER_SIZE
+            + self.max_payload.max(crate::auth::CHALLENGE_SIZE)
+            + crate::auth::TAG_SIZE) as u32;
+        if self.per_connection.bytes_per_second < size || self.global.bytes_per_second < size {
+            return Err(ConfigError::Limits);
+        }
+        Ok(())
+    }
+
     pub fn new(bind: SocketAddrV4, game: GameId, application_versions: Vec<u32>) -> Self {
         Self {
             bind,

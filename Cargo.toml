@@ -6,7 +6,15 @@ rust-version = "1.89"
 description = "ADLN networking for standalone Nintendo DS game services"
 publish = false
 
+[workspace]
+members = ["platform"]
+resolver = "3"
+
 [dependencies]
+hmac = "0.12"
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = "1"
 rand = "0.8.5"
 subtle = "2.6"
 thiserror = "2"

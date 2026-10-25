@@ -7,6 +7,11 @@ use rand::{RngCore, rngs::OsRng};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 
+mod authentication;
+use crate::auth::{self, CredentialStore, Identity};
+use authentication::{Authentication, Session};
+use std::sync::Arc;
+
 use crate::limit::{Bucket, Budget};
 use crate::protocol::{self, ConnectionToken, Hello, Kind, Packet, Reject, RejectCode, Welcome};
 use crate::replay::ReplayWindow;
@@ -24,6 +29,8 @@ pub struct Statistics {
     pub sent: u64,
     pub send_dropped: u64,
     pub socket_errors: u64,
+    pub auth_failed: u64,
+    pub auth_backend_errors: u64,
 }
 
 #[derive(Debug, Error)]
@@ -45,6 +52,7 @@ pub enum SendError {
 }
 
 struct Peer {
+    session: Option<Session>,
     connection: Connection,
     nonce: u64,
     token: ConnectionToken,
@@ -57,13 +65,14 @@ struct Peer {
     data_sequences: Vec<u32>,
 }
 
-/// One anonymous game-service endpoint. The application drives this endpoint
-/// through `next_event` and owns its own world/match state and timers.
+/// One game-service endpoint with optional authenticated device connections.
+/// The application drives `next_event` and owns its world/match state and timers.
 ///
 /// `next_event` is cancellation-safe in `tokio::select!`. Poll it regularly;
 /// blocking game work also blocks heartbeat processing in this task. Dropping
 /// the endpoint releases its socket without starting/stopping a Tokio runtime.
 pub struct Endpoint {
+    authentication: Authentication,
     socket: Option<UdpSocket>,
     address: SocketAddrV4,
     config: ServerConfig,
@@ -83,10 +92,11 @@ impl Endpoint {
         // Establish writable readiness before synchronous, nonqueued sends.
         socket.writable().await?;
         let SocketAddr::V4(address) = socket.local_addr()? else {
-            return Err(io::Error::other("ADLN v1 endpoint requires IPv4"));
+            return Err(io::Error::other("ADLN endpoint requires IPv4"));
         };
         let now = Instant::now();
         Ok(Self {
+            authentication: Authentication::default(),
             socket: Some(socket),
             address,
             inbound: Budget::new(&config.global, now),
@@ -98,6 +108,30 @@ impl Endpoint {
             admission: HashMap::new(),
             statistics: Statistics::default(),
         })
+    }
+
+    /// Enables linked device login alongside the existing anonymous protocol.
+    /// Credentials are looked up off the packet path, with bounded concurrency.
+    pub async fn bind_with_auth(
+        config: ServerConfig,
+        store: Arc<dyn CredentialStore>,
+    ) -> io::Result<Self> {
+        config.validate_authenticated().map_err(io::Error::other)?;
+        let mut endpoint = Self::bind(config).await?;
+        endpoint.authentication.store = Some(store);
+        Ok(endpoint)
+    }
+
+    pub fn identity(&self, id: ConnectionId) -> Option<&Identity> {
+        self.peers
+            .get(&id)?
+            .session
+            .as_ref()
+            .map(|session| &session.identity)
+    }
+
+    pub fn authentication_enabled(&self) -> bool {
+        self.authentication.store.is_some()
     }
 
     pub fn local_addr(&self) -> SocketAddrV4 {
@@ -133,6 +167,12 @@ impl Endpoint {
         }
         if channel >= self.config.channels {
             return Err(SendError::Channel);
+        }
+        if self.peers.get(&recipient).is_some_and(|peer| {
+            peer.session.is_some() && peer.data_sequences[channel as usize] >= auth::SEQUENCE_LIMIT
+        }) {
+            self.remove(recipient, DisconnectReason::Application);
+            return Err(SendError::UnknownConnection);
         }
         let peer = self
             .peers
@@ -178,11 +218,13 @@ impl Endpoint {
         for connection in connections {
             let _ = self.disconnect(connection, DisconnectReason::ServerShutdown);
         }
+        self.authentication.tasks.abort_all();
+        self.authentication.pending.clear();
         self.socket.take();
     }
 
     pub async fn next_event(&mut self) -> io::Result<Option<Event>> {
-        let mut buffer = [0u8; protocol::HEADER_SIZE + protocol::MAX_PAYLOAD + 1];
+        let mut buffer = [0u8; protocol::HEADER_SIZE + protocol::MAX_PAYLOAD + auth::TAG_SIZE + 1];
         let mut processed = 0;
         loop {
             if let Some(event) = self.events.pop_front() {
@@ -192,6 +234,9 @@ impl Endpoint {
                 return Ok(None);
             }
             let now = Instant::now();
+            self.authentication
+                .pending
+                .retain(|_, pending| pending.deadline > now);
             let expired = self.peers.iter().find_map(|(id, peer)| {
                 (now.saturating_duration_since(peer.seen) >= self.config.idle_timeout)
                     .then_some(*id)
@@ -210,10 +255,22 @@ impl Endpoint {
                 .map(|peer| peer.seen + self.config.idle_timeout)
                 .min()
                 .unwrap_or(now + Duration::from_secs(3600));
+            let deadline = self
+                .authentication
+                .pending
+                .values()
+                .map(|pending| pending.deadline)
+                .min()
+                .map_or(deadline, |auth_deadline| deadline.min(auth_deadline));
             let socket = self.socket.as_ref().unwrap();
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => (),
+                result = self.authentication.tasks.join_next(), if !self.authentication.tasks.is_empty() => {
+                    if let Some(Ok((address, id, credential))) = result {
+                        self.auth_lookup_complete(address, id, credential)?;
+                    }
+                }
                 result = socket.readable() => {
                     processed += 1;
                     match result.and_then(|()| socket.try_recv_from(&mut buffer)) {
@@ -254,8 +311,24 @@ impl Endpoint {
         peer: Option<ConnectionId>,
         packet: Packet,
     ) -> Result<(), SendError> {
+        let bytes = match peer
+            .and_then(|id| self.peers.get(&id))
+            .and_then(|peer| peer.session.as_ref())
+        {
+            Some(session) => auth::encode(&packet, Some(&session.keys.server)),
+            None => packet.encode(),
+        }
+        .map_err(|_| SendError::Payload)?;
+        self.emit_bytes(address, peer, &bytes)
+    }
+
+    fn emit_bytes(
+        &mut self,
+        address: SocketAddrV4,
+        peer: Option<ConnectionId>,
+        bytes: &[u8],
+    ) -> Result<(), SendError> {
         let socket = self.socket.as_ref().ok_or(SendError::Closed)?;
-        let bytes = packet.encode().map_err(|_| SendError::Payload)?;
         let now = Instant::now();
         if !self.outbound.take(bytes.len(), now)
             || peer.is_some_and(|id| {
@@ -269,7 +342,7 @@ impl Endpoint {
             self.statistics.send_dropped += 1;
             return Err(SendError::RateLimited);
         }
-        match socket.try_send_to(&bytes, address.into()) {
+        match socket.try_send_to(bytes, address.into()) {
             Ok(length) if length == bytes.len() => {
                 self.statistics.sent += 1;
                 Ok(())
@@ -293,6 +366,12 @@ impl Endpoint {
         kind: Kind,
         payload: Vec<u8>,
     ) -> Result<(), SendError> {
+        if self.peers.get(&id).is_some_and(|peer| {
+            peer.session.is_some() && peer.control_sequence >= auth::SEQUENCE_LIMIT
+        }) {
+            self.remove(id, DisconnectReason::Application);
+            return Err(SendError::UnknownConnection);
+        }
         let peer = self
             .peers
             .get_mut(&id)
@@ -312,7 +391,10 @@ impl Endpoint {
 
     fn control_result(result: Result<(), SendError>) -> io::Result<()> {
         match result {
-            Ok(()) | Err(SendError::RateLimited | SendError::Backpressure) => Ok(()),
+            Ok(())
+            | Err(
+                SendError::RateLimited | SendError::Backpressure | SendError::UnknownConnection,
+            ) => Ok(()),
             Err(SendError::Io(error)) => Err(error),
             Err(error) => Err(io::Error::other(error)),
         }
@@ -324,7 +406,13 @@ impl Endpoint {
             self.statistics.rate_limited += 1;
             return Ok(());
         }
-        let packet = match Packet::decode(bytes) {
+        let linked = bytes.get(4) == Some(&auth::VERSION);
+        let decoded = if linked {
+            auth::decode(bytes)
+        } else {
+            Packet::decode(bytes)
+        };
+        let packet = match decoded {
             Ok(packet)
                 if packet.kind != Kind::Data || packet.payload.len() <= self.config.max_payload =>
             {
@@ -335,7 +423,13 @@ impl Endpoint {
                 return Ok(());
             }
         };
-        if packet.kind == Kind::Hello {
+        if linked && packet.kind == Kind::AuthHello {
+            return self.auth_hello(packet, bytes, address, now);
+        }
+        if linked && packet.kind == Kind::AuthProof {
+            return self.auth_proof(packet, bytes, address, now);
+        }
+        if !linked && packet.kind == Kind::Hello {
             return self.hello(packet, address, now);
         }
         let Some(peer) = self.peers.get_mut(&packet.connection) else {
@@ -348,6 +442,19 @@ impl Endpoint {
         }
         if !peer.inbound.take(bytes.len(), now) {
             self.statistics.rate_limited += 1;
+            return Ok(());
+        }
+        if linked != peer.session.is_some()
+            || peer
+                .session
+                .as_ref()
+                .is_some_and(|session| !auth::verify(bytes, &session.keys.client))
+        {
+            self.statistics.auth_failed += 1;
+            return Ok(());
+        }
+        if linked && packet.sequence >= auth::SEQUENCE_LIMIT {
+            let _ = self.disconnect(packet.connection, DisconnectReason::Application);
             return Ok(());
         }
         let replay = match packet.kind {
@@ -447,9 +554,13 @@ impl Endpoint {
         if let Some(code) = reject {
             return self.reject(address, hello.nonce, code);
         }
+        if self.authentication.pending.contains_key(&address) {
+            return self.reject(address, hello.nonce, RejectCode::EndpointInUse);
+        }
         let id = if let Some(id) = self.addresses.get(&address).copied() {
             let peer = &self.peers[&id];
-            if peer.nonce != hello.nonce
+            if peer.session.is_some()
+                || peer.nonce != hello.nonce
                 || peer.connection.application_version != hello.application_version
             {
                 // An unauthenticated HELLO cannot replace a live connection.
@@ -457,12 +568,15 @@ impl Endpoint {
             }
             id
         } else {
-            if self.peers.len() >= self.config.max_connections {
+            if self.peers.len() + self.authentication.pending.len() >= self.config.max_connections {
                 return self.reject(address, hello.nonce, RejectCode::Capacity);
             }
             let id = loop {
                 let value = ConnectionId(u64::from_le_bytes(random_bytes()?));
-                if value.0 != 0 && !self.peers.contains_key(&value) {
+                if value.0 != 0
+                    && !self.peers.contains_key(&value)
+                    && !self.authentication.reserves(value)
+                {
                     break value;
                 }
             };
@@ -481,6 +595,7 @@ impl Endpoint {
             self.peers.insert(
                 id,
                 Peer {
+                    session: None,
                     connection: connection.clone(),
                     nonce: hello.nonce,
                     token,

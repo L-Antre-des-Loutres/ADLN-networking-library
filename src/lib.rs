@@ -1,7 +1,8 @@
-//! Anonymous, ADLN transport for independent game services.
+//! ADLN transport for independent game services.
 //! Applications own their state, routing and timers. No game grouping, player
 //! host, account backend, logging loop or background runtime is imposed.
 //! UDP payloads are not encrypted. Connection tokens are not account credentials.
+pub mod auth;
 mod config;
 mod endpoint;
 mod limit;
