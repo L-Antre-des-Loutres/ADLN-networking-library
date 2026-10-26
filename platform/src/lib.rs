@@ -1,6 +1,7 @@
 //! Server-only account storage. Keep the PocketBase service token and wrapping
 //! key on the VPS; never include them in a ROM, save or browser bundle.
 //! Existing players/discord_users/platforms collections are read without mutation.
+mod diagnostics;
 mod pocketbase;
 pub mod secrets;
 mod token;
@@ -90,6 +91,9 @@ impl Config {
             Secret::new(*bytes),
             self.allow_http,
         )?;
+        // Connectivity is checked once at startup. Failure is logged, but a
+        // backend outage must not prevent anonymous play or service startup.
+        let _ = store.check_health().await;
         Ok(Arc::new(store))
     }
 }

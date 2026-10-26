@@ -365,3 +365,80 @@ async fn token_file_startup_rejects_missing_empty_or_relative_sources() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn actual_lookup_logs_token_failure_once_then_recovery_without_private_data() {
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let captured = Capture::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .flatten_event(true)
+        .without_time()
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    // Match the server's global subscriber. A thread-local subscriber around a
+    // future can lose events when parallel tests register the same callsites.
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+    let (url, task) = rotating_backend(vec![
+        (401, "private-service-token"),
+        (401, "private-service-token"),
+        (200, "private-service-token"),
+    ])
+    .await;
+    let expected_backend = reqwest::Url::parse(&url)
+        .unwrap()
+        .origin()
+        .ascii_serialization();
+    async {
+        let store = PocketBase::new(&url, "private-service-token", key()).unwrap();
+        let game = GameId(u32::from_le_bytes(*b"MKDS"));
+        assert!(matches!(
+            store.lookup(device(), game).await,
+            Err(LookupError::Unavailable)
+        ));
+        assert!(matches!(
+            store.clone().lookup(device(), game).await,
+            Err(LookupError::Unavailable)
+        ));
+        assert!(store.lookup(device(), game).await.is_ok());
+        task.await.unwrap();
+    }
+    .await;
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    for private in [
+        "private-service-token",
+        "device000000001",
+        "assigned-by-our-service",
+        "secret_ciphertext",
+    ] {
+        assert!(!logs.contains(private));
+    }
+    let events: Vec<Value> = logs
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["backend"] == expected_backend)
+        .collect();
+    assert_eq!(events.len(), 2, "Captured diagnostics: {logs}");
+    assert_eq!(events[0]["event"], "pocketbase_unavailable");
+    assert_eq!(events[0]["reason"], "service_token_rejected");
+    assert_eq!(events[0]["http_status"], 401);
+    assert_eq!(events[1]["event"], "pocketbase_recovered");
+    assert_eq!(events[1]["failed_requests"], 2);
+}

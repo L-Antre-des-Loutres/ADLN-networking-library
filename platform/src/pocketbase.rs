@@ -1,3 +1,4 @@
+use crate::diagnostics::{Diagnostics, Issue};
 use crate::secrets;
 use crate::token::{self, TokenSource};
 use adln_networking::{
@@ -17,6 +18,7 @@ struct Inner {
     base: Url,
     wrapping: Secret,
     token: TokenSource,
+    diagnostics: Diagnostics,
 }
 
 pub(crate) fn base_url(value: &str, allow_http: bool) -> io::Result<Url> {
@@ -87,16 +89,81 @@ impl PocketBase {
                 base,
                 wrapping,
                 token,
+                diagnostics: Diagnostics::default(),
             }),
         })
     }
+    fn unavailable(&self, operation: &'static str, issue: Issue) -> LookupError {
+        self.inner
+            .diagnostics
+            .failure(&self.inner.base, operation, issue);
+        LookupError::Unavailable
+    }
+
+    pub(crate) async fn check_health(&self) -> Result<(), LookupError> {
+        const OPERATION: &str = "startup_health";
+        let url = self
+            .inner
+            .base
+            .join("api/health")
+            .map_err(|_| self.unavailable(OPERATION, Issue::Request))?;
+        // This endpoint checks reachability only. No token is attached and no
+        // periodic health request can falsely clear a later login/token failure.
+        let response = self
+            .inner
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| self.unavailable(OPERATION, Issue::request(&error)))?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(self.unavailable(OPERATION, Issue::Http(response.status().as_u16())));
+        }
+        #[derive(Deserialize)]
+        struct Health {
+            status: u16,
+        }
+        let health: Health = self.read_json(response, OPERATION).await?;
+        if health.status != 200 {
+            return Err(self.unavailable(OPERATION, Issue::InvalidResponse));
+        }
+        self.inner.diagnostics.success(&self.inner.base, OPERATION);
+        Ok(())
+    }
+
+    async fn read_json<T: serde::de::DeserializeOwned>(
+        &self,
+        mut response: reqwest::Response,
+        operation: &'static str,
+    ) -> Result<T, LookupError> {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            self.unavailable(
+                operation,
+                if error.is_timeout() {
+                    Issue::Timeout
+                } else {
+                    Issue::BodyRead
+                },
+            )
+        })? {
+            if bytes.len() + chunk.len() > 65536 {
+                return Err(self.unavailable(operation, Issue::BodyTooLarge));
+            }
+            bytes.extend(chunk);
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|_| self.unavailable(operation, Issue::InvalidResponse))
+    }
+
     async fn fetch(&self, device: DeviceId, game: GameId) -> Result<Credential, LookupError> {
+        const OPERATION: &str = "credential_lookup";
         let authorization = self
             .inner
             .token
             .header()
             .await
-            .map_err(|_| LookupError::Unavailable)?;
+            .map_err(|_| self.unavailable(OPERATION, Issue::TokenSource))?;
         let url = self
             .inner
             .base
@@ -104,8 +171,8 @@ impl PocketBase {
                 "api/collections/adln_devices/records/{}",
                 device.as_str()
             ))
-            .map_err(|_| LookupError::Unavailable)?;
-        let mut response = self
+            .map_err(|_| self.unavailable(OPERATION, Issue::Request))?;
+        let response = self
             .inner
             .client
             .get(url)
@@ -113,25 +180,15 @@ impl PocketBase {
             .query(&[("expand", "player,player.platform")])
             .send()
             .await
-            .map_err(|_| LookupError::Unavailable)?;
+            .map_err(|error| self.unavailable(OPERATION, Issue::request(&error)))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(LookupError::Denied);
         }
         if response.status() != reqwest::StatusCode::OK {
-            return Err(LookupError::Unavailable);
+            return Err(self.unavailable(OPERATION, Issue::Http(response.status().as_u16())));
         }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| LookupError::Unavailable)?
-        {
-            if bytes.len() + chunk.len() > 65536 {
-                return Err(LookupError::Unavailable);
-            }
-            bytes.extend(chunk);
-        }
-        let record: Device = serde_json_from_slice(&bytes)?;
+        let record: Device = self.read_json(response, OPERATION).await?;
+        self.inner.diagnostics.success(&self.inner.base, OPERATION);
         let player = record.expand.player;
         let game =
             String::from_utf8(game.0.to_le_bytes().to_vec()).map_err(|_| LookupError::Denied)?;
@@ -171,10 +228,6 @@ impl CredentialStore for PocketBase {
         let this = self.clone();
         Box::pin(async move { this.fetch(device, game).await })
     }
-}
-fn serde_json_from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, LookupError> {
-    // reqwest's JSON helper cannot bound the response body before allocation.
-    serde_json::from_slice(bytes).map_err(|_| LookupError::Unavailable)
 }
 // Missing fields/expansions fail closed; revoked and games must be explicit.
 #[derive(Deserialize)]
