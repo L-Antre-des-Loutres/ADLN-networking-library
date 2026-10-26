@@ -19,7 +19,7 @@ struct Inner {
     token: TokenSource,
 }
 
-pub(crate) fn base_url(value: &str) -> io::Result<Url> {
+pub(crate) fn base_url(value: &str, allow_http: bool) -> io::Result<Url> {
     let url = Url::parse(value).map_err(|_| io::Error::other("Invalid PocketBase URL"))?;
     let loopback = url.host_str().is_some_and(|host| {
         host.eq_ignore_ascii_case("localhost")
@@ -29,7 +29,7 @@ pub(crate) fn base_url(value: &str) -> io::Result<Url> {
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback())
     });
-    if !(url.scheme() == "https" || url.scheme() == "http" && loopback)
+    if !(url.scheme() == "https" || url.scheme() == "http" && (loopback || allow_http))
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -38,7 +38,7 @@ pub(crate) fn base_url(value: &str) -> io::Result<Url> {
         || !url.path().ends_with('/')
     {
         return Err(io::Error::other(
-            "PocketBase URL must end with / and use HTTPS (HTTP allowed only on loopback), without credentials, query or fragment",
+            "PocketBase URL must end with / and use HTTPS (HTTP beyond loopback requires allow_http = true), without credentials, query or fragment",
         ));
     }
     Ok(url)
@@ -49,6 +49,7 @@ impl PocketBase {
             url,
             TokenSource::Fixed(token::header(bearer.as_bytes())?),
             wrapping,
+            false,
         )
     }
 
@@ -63,11 +64,16 @@ impl PocketBase {
         }
         let source = TokenSource::File(path);
         source.header().await?;
-        Self::with_source(url, source, wrapping)
+        Self::with_source(url, source, wrapping, false)
     }
 
-    fn with_source(url: &str, token: TokenSource, wrapping: Secret) -> io::Result<Self> {
-        let base = base_url(url)?;
+    pub(crate) fn with_source(
+        url: &str,
+        token: TokenSource,
+        wrapping: Secret,
+        allow_http: bool,
+    ) -> io::Result<Self> {
+        let base = base_url(url, allow_http)?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(2))

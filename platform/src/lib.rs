@@ -17,6 +17,9 @@ use zeroize::Zeroizing;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub pocketbase_url: String,
+    /// Opt in to plain HTTP on a trusted private backend network, such as Docker.
+    #[serde(default)]
+    pub allow_http: bool,
     #[serde(default = "token_env")]
     pub token_env: String,
     /// Reloaded at every login. Takes precedence over the startup-only token_env.
@@ -33,7 +36,7 @@ fn key_env() -> String {
 }
 impl Config {
     pub fn validate(&self) -> io::Result<()> {
-        pocketbase::base_url(&self.pocketbase_url)?;
+        pocketbase::base_url(&self.pocketbase_url, self.allow_http)?;
         if self
             .token_file
             .as_ref()
@@ -65,12 +68,13 @@ impl Config {
     /// Loads secrets only at actual startup, not during --check-config.
     pub async fn connect(&self) -> io::Result<Arc<dyn CredentialStore>> {
         self.validate()?;
-        let token = if self.token_file.is_none() {
-            Some(Zeroizing::new(std::env::var(&self.token_env).map_err(
-                |_| io::Error::other("PocketBase service token environment variable is missing"),
-            )?))
+        let source = if let Some(path) = &self.token_file {
+            token::TokenSource::File(path.clone())
         } else {
-            None
+            let value = Zeroizing::new(std::env::var(&self.token_env).map_err(|_| {
+                io::Error::other("PocketBase service token environment variable is missing")
+            })?);
+            token::TokenSource::Fixed(token::header(value.as_bytes())?)
         };
         let key = Zeroizing::new(std::env::var(&self.wrapping_key_env).map_err(|_| {
             io::Error::other("Device wrapping key environment variable is missing")
@@ -79,16 +83,13 @@ impl Config {
         hex::decode_to_slice(key.as_bytes(), bytes.as_mut()).map_err(|_| {
             io::Error::other("Device wrapping key must be 64 hexadecimal characters")
         })?;
-        let store = if let Some(path) = &self.token_file {
-            PocketBase::from_token_file(&self.pocketbase_url, path.clone(), Secret::new(*bytes))
-                .await?
-        } else {
-            PocketBase::new(
-                &self.pocketbase_url,
-                token.as_ref().unwrap().as_str(),
-                Secret::new(*bytes),
-            )?
-        };
+        source.header().await?;
+        let store = PocketBase::with_source(
+            &self.pocketbase_url,
+            source,
+            Secret::new(*bytes),
+            self.allow_http,
+        )?;
         Ok(Arc::new(store))
     }
 }

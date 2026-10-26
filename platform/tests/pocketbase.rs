@@ -183,6 +183,33 @@ fn refuses_insecure_remote_storage_and_secret_bearing_urls() {
     assert!(PocketBase::new("http://[::1]:8090/", "token", key()).is_ok());
 }
 
+#[test]
+fn private_http_requires_explicit_opt_in_and_keeps_url_credentials_disallowed() {
+    let config = |url: &str, allow_http: bool| {
+        serde_json::from_value::<adln_platform::Config>(json!({
+            "pocketbase_url": url, "allow_http": allow_http,
+        }))
+        .unwrap()
+    };
+    assert!(config("http://pocketbase:8090/", false).validate().is_err());
+    assert!(config("http://pocketbase:8090/", true).validate().is_ok());
+    let default: adln_platform::Config = serde_json::from_value(json!({
+        "pocketbase_url":"http://pocketbase:8090/",
+    }))
+    .unwrap();
+    assert!(!default.allow_http);
+    assert!(default.validate().is_err());
+    for url in [
+        "http://user:password@pocketbase:8090/",
+        "http://pocketbase:8090/?token=secret",
+        "http://pocketbase:8090/#fragment",
+        "http://pocketbase:8090/pb",
+        "ftp://pocketbase/",
+    ] {
+        assert!(config(url, true).validate().is_err());
+    }
+}
+
 struct TokenFile {
     directory: std::path::PathBuf,
     path: std::path::PathBuf,
